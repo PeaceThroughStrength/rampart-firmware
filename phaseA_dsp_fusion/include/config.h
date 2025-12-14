@@ -112,6 +112,28 @@
 #endif
 
 // ----------------------------
+// Evidence capture (in-memory ring buffers)
+// ----------------------------
+
+// Audio evidence window sizes (frames).
+#ifndef EVID_AUDIO_PRE_FRAMES
+#define EVID_AUDIO_PRE_FRAMES 8u
+#endif
+
+#ifndef EVID_AUDIO_POST_FRAMES
+#define EVID_AUDIO_POST_FRAMES 8u
+#endif
+
+// Accel evidence window sizes (samples).
+#ifndef EVID_ACCEL_PRE_SAMPLES
+#define EVID_ACCEL_PRE_SAMPLES 40u
+#endif
+
+#ifndef EVID_ACCEL_POST_SAMPLES
+#define EVID_ACCEL_POST_SAMPLES 40u
+#endif
+
+// ----------------------------
 // Mocks: correlated burst scheduler
 // ----------------------------
 

@@ -27,6 +27,13 @@ struct EventRecord {
   uint8_t fsm_state;
   uint8_t flags;
 
+  // Evidence reference (in-memory ring buffers).
+  uint32_t evidence_id;
+  uint16_t audio_frames;
+  uint16_t accel_samples;
+  uint16_t audio_start_idx;
+  uint16_t accel_start_idx;
+
   // Tamper-evident hash chaining (per-boot).
   uint64_t boot_id;
   uint64_t prev_hash;
@@ -73,6 +80,13 @@ static inline uint64_t event_hash(const EventRecord &r) {
   h = fnv1a64(&type_u8, sizeof(type_u8), h);
   h = fnv1a64(&r.fsm_state, sizeof(r.fsm_state), h);
   h = fnv1a64(&r.flags, sizeof(r.flags), h);
+
+  // Evidence reference.
+  h = fnv1a64(&r.evidence_id, sizeof(r.evidence_id), h);
+  h = fnv1a64(&r.audio_frames, sizeof(r.audio_frames), h);
+  h = fnv1a64(&r.accel_samples, sizeof(r.accel_samples), h);
+  h = fnv1a64(&r.audio_start_idx, sizeof(r.audio_start_idx), h);
+  h = fnv1a64(&r.accel_start_idx, sizeof(r.accel_start_idx), h);
 
   // Feature snapshots.
   h = fnv1a64(&r.audio_rms, sizeof(r.audio_rms), h);
@@ -178,6 +192,16 @@ inline void log_print_one_line(const EventRecord &r, Print &out) {
   out.print((unsigned)r.fsm_state);
   out.print(" fl=");
   out.print((unsigned)r.flags);
+  out.print(" evid=");
+  out.print((unsigned long)r.evidence_id);
+  out.print(" afr=");
+  out.print((unsigned)r.audio_frames);
+  out.print(" as=");
+  out.print((unsigned)r.accel_samples);
+  out.print(" aidx=");
+  out.print((unsigned)r.audio_start_idx);
+  out.print(" gidx=");
+  out.print((unsigned)r.accel_start_idx);
   out.print(" a_rms=");
   out.print(r.audio_rms);
   out.print(" a_pk=");

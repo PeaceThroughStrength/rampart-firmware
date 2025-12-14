@@ -8,6 +8,7 @@
 #include "audio_i2s.h"
 #include "config.h"
 #include "dsp_features.h"
+#include "evidence_buffers.h"
 #include "event_log.h"
 #include "fusion_fsm.h"
 
@@ -21,6 +22,10 @@ RampartMockCorrelation g_rampart_mock_corr;
 namespace {
 
 static uint64_t g_boot_id = 0;
+static uint32_t g_next_evidence_id = 1;
+
+static rampart::AudioEvidenceBuffer g_audio_evid;
+static rampart::AccelEvidenceBuffer g_accel_evid;
 
 static uint64_t make_boot_id() {
 #if defined(ESP32)
@@ -54,6 +59,18 @@ static void emit_and_print(EventRecord &e) {
   log_print_one_line(g_event_log.buf[last_idx], Serial);
 }
 
+static void attach_evidence(EventRecord &e) {
+  const uint32_t evid = g_next_evidence_id++;
+  const rampart::AudioEvidenceRef ar = g_audio_evid.freeze_begin(evid);
+  const rampart::AccelEvidenceRef gr = g_accel_evid.freeze_begin(evid);
+
+  e.evidence_id = evid;
+  e.audio_frames = ar.frames;
+  e.audio_start_idx = ar.start_idx;
+  e.accel_samples = gr.samples;
+  e.accel_start_idx = gr.start_idx;
+}
+
 }  // namespace
 
 void setup() {
@@ -69,6 +86,9 @@ void setup() {
   digitalWrite(LED_BUILTIN, LOW);
 
   g_boot_id = make_boot_id();
+
+  g_audio_evid.init();
+  g_accel_evid.init();
 
   log_init();
 
@@ -91,6 +111,7 @@ void setup() {
   boot.type = EventType::BOOT;
   boot.t_ms = millis();
   boot.fsm_state = 0;
+  attach_evidence(boot);
   emit_and_print(boot);
 }
 
@@ -110,6 +131,7 @@ void loop() {
       e.type = EventType::ARMED_CHANGED;
       e.t_ms = now_ms;
       e.flags = armed ? 1 : 0;
+      attach_evidence(e);
       emit_and_print(e);
       Serial.print("armed=");
       Serial.println(armed ? "true" : "false");
@@ -117,6 +139,7 @@ void loop() {
       EventRecord e{};
       e.type = EventType::TEST;
       e.t_ms = now_ms;
+      attach_evidence(e);
       emit_and_print(e);
     }
   }
@@ -144,6 +167,7 @@ void loop() {
   if (now_ms >= next_audio_ms) {
     AudioFrame frame;
     if (audio_read_frame(frame)) {
+      g_audio_evid.push_frame(frame.samples);
       audio_compute_features(frame.samples, AudioFrame::kSamples, audio_sample_rate_hz(),
                              audio_feat);
     }
@@ -156,6 +180,7 @@ void loop() {
   if (now_ms >= next_accel_ms) {
     AccelSample s;
     if (accel_read_sample(s)) {
+      g_accel_evid.push_sample(s);
       accel_compute_features(s, accel_state, accel_feat);
     }
     next_accel_ms = now_ms + accel_period_ms;
@@ -164,8 +189,13 @@ void loop() {
   // FSM tick.
   EventRecord evt{};
   if (fsm_tick(fsm, armed, now_ms, audio_feat, accel_feat, evt)) {
+    attach_evidence(evt);
     emit_and_print(evt);
   }
+
+  // Advance post-capture state machines.
+  g_audio_evid.tick_post_capture();
+  g_accel_evid.tick_post_capture();
 
   // Periodic feature summary.
   static uint32_t next_print_ms = 0;
