@@ -1,5 +1,9 @@
 #include <Arduino.h>
 
+#if defined(ESP32)
+#include <esp_system.h>
+#endif
+
 #include "accel_adxl345.h"
 #include "audio_i2s.h"
 #include "config.h"
@@ -16,14 +20,38 @@ RampartMockCorrelation g_rampart_mock_corr;
 
 namespace {
 
+static uint64_t g_boot_id = 0;
+
+static uint64_t make_boot_id() {
+#if defined(ESP32)
+  // Prefer ESP HW RNG when available.
+  const uint64_t hi = ((uint64_t)esp_random()) << 32;
+  const uint64_t lo = (uint64_t)esp_random();
+  uint64_t id = hi | lo;
+  if (id == 0) id = 1;
+  return id;
+#else
+  // Fallback for non-ESP builds.
+  uint64_t id = ((uint64_t)micros() << 32) ^ (uint64_t)millis();
+  if (id == 0) id = 1;
+  return id;
+#endif
+}
+
 static uint32_t frame_period_ms() {
   return (uint32_t)((1000ull * (uint64_t)RAMPART_AUDIO_FRAME_SAMPLES) /
                     (uint64_t)RAMPART_AUDIO_SAMPLE_RATE_HZ);
 }
 
 static void emit_and_print(EventRecord &e) {
+  // Ensure every emitted record carries this boot identity.
+  e.boot_id = g_boot_id;
   log_append(e);
-  log_print_one_line(e, Serial);
+
+  // Print the actual stored record (seq/prev_hash/hash are assigned in log_append).
+  const uint16_t cap = (uint16_t)RAMPART_EVENT_LOG_CAPACITY;
+  const uint16_t last_idx = (uint16_t)((g_event_log.head + cap - 1u) % cap);
+  log_print_one_line(g_event_log.buf[last_idx], Serial);
 }
 
 }  // namespace
@@ -39,6 +67,8 @@ void setup() {
 
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, LOW);
+
+  g_boot_id = make_boot_id();
 
   log_init();
 

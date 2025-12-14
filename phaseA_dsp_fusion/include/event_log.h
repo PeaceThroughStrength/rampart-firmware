@@ -27,6 +27,11 @@ struct EventRecord {
   uint8_t fsm_state;
   uint8_t flags;
 
+  // Tamper-evident hash chaining (per-boot).
+  uint64_t boot_id;
+  uint64_t prev_hash;
+  uint64_t hash;
+
   // Snapshot of select features (scaled).
   int16_t audio_rms;
   int16_t audio_peak;
@@ -37,6 +42,49 @@ struct EventRecord {
   int16_t accel_peak_mg;
   uint16_t accel_impulse_mg;
 };
+
+// FNV-1a 64-bit helper.
+// Seed is the starting hash value, allowing incremental hashing.
+static inline uint64_t fnv1a64(const void *data, size_t len, uint64_t seed) {
+  static constexpr uint64_t kFnvPrime = 1099511628211ull;
+  uint64_t h = seed;
+  const uint8_t *p = (const uint8_t *)data;
+  for (size_t i = 0; i < len; ++i) {
+    h ^= (uint64_t)p[i];
+    h *= kFnvPrime;
+  }
+  return h;
+}
+
+// Canonical record hash. Ordering is explicit and stable.
+// MUST include boot_id and prev_hash, MUST NOT include hash.
+static inline uint64_t event_hash(const EventRecord &r) {
+  static constexpr uint64_t kFnvOffsetBasis = 14695981039346656037ull;
+  uint64_t h = kFnvOffsetBasis;
+
+  // Chain/identity first.
+  h = fnv1a64(&r.boot_id, sizeof(r.boot_id), h);
+  h = fnv1a64(&r.prev_hash, sizeof(r.prev_hash), h);
+
+  // Core metadata.
+  h = fnv1a64(&r.seq, sizeof(r.seq), h);
+  h = fnv1a64(&r.t_ms, sizeof(r.t_ms), h);
+  const uint8_t type_u8 = (uint8_t)r.type;
+  h = fnv1a64(&type_u8, sizeof(type_u8), h);
+  h = fnv1a64(&r.fsm_state, sizeof(r.fsm_state), h);
+  h = fnv1a64(&r.flags, sizeof(r.flags), h);
+
+  // Feature snapshots.
+  h = fnv1a64(&r.audio_rms, sizeof(r.audio_rms), h);
+  h = fnv1a64(&r.audio_peak, sizeof(r.audio_peak), h);
+  h = fnv1a64(&r.audio_zcr_q15, sizeof(r.audio_zcr_q15), h);
+  h = fnv1a64(&r.audio_hfe, sizeof(r.audio_hfe), h);
+  h = fnv1a64(&r.accel_mag_mg, sizeof(r.accel_mag_mg), h);
+  h = fnv1a64(&r.accel_peak_mg, sizeof(r.accel_peak_mg), h);
+  h = fnv1a64(&r.accel_impulse_mg, sizeof(r.accel_impulse_mg), h);
+
+  return h;
+}
 
 // Log capacity: tuned for low RAM use.
 #ifndef RAMPART_EVENT_LOG_CAPACITY
@@ -85,6 +133,16 @@ inline void log_init() { log_init(g_event_log); }
 inline void log_append(EventLog &log, const EventRecord &rec_in) {
   EventRecord rec = rec_in;
   rec.seq = log.next_seq++;
+
+  // Hash chain: previous hash is the last stored record's hash (or 0 if empty).
+  rec.prev_hash = 0;
+  if (log.count > 0) {
+    const uint16_t cap = (uint16_t)RAMPART_EVENT_LOG_CAPACITY;
+    const uint16_t last_idx = (uint16_t)((log.head + cap - 1u) % cap);
+    rec.prev_hash = log.buf[last_idx].hash;
+  }
+  rec.hash = event_hash(rec);
+
   log.buf[log.head] = rec;
   log.head = (uint16_t)((log.head + 1u) % (uint16_t)RAMPART_EVENT_LOG_CAPACITY);
   if (log.count < (uint16_t)RAMPART_EVENT_LOG_CAPACITY) {
@@ -95,8 +153,23 @@ inline void log_append(EventLog &log, const EventRecord &rec_in) {
 inline void log_append(const EventRecord &rec) { log_append(g_event_log, rec); }
 
 inline void log_print_one_line(const EventRecord &r, Print &out) {
+  auto print_hex_u64 = [&](uint64_t v) {
+    static const char kHex[] = "0123456789abcdef";
+    char buf[16];
+    for (int i = 15; i >= 0; --i) {
+      buf[i] = kHex[(uint8_t)(v & 0xFu)];
+      v >>= 4;
+    }
+    out.print("0x");
+    for (int i = 0; i < 16; ++i) out.print(buf[i]);
+  };
+
   out.print("EVT ");
   out.print(r.seq);
+  out.print(" prev=");
+  print_hex_u64(r.prev_hash);
+  out.print(" hash=");
+  print_hex_u64(r.hash);
   out.print(" t=");
   out.print(r.t_ms);
   out.print(" type=");
@@ -143,4 +216,3 @@ inline void log_dump_serial(const EventLog &log, Print &out = Serial) {
 }
 
 inline void log_dump_serial() { log_dump_serial(g_event_log, Serial); }
-
