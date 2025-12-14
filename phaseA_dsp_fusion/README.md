@@ -58,3 +58,19 @@ When `RAMPART_USE_MOCKS=0`:
 - Accelerometer uses `Wire` with ADXL345 DEVID `0xE5`, sets measurement mode, reads XYZ and converts to g in [`src/accel_adxl345.cpp`](src/accel_adxl345.cpp)
 
 Pin constants and thresholds live in [`include/config.h`](include/config.h).
+
+## First Power-On (ESP32-S3)
+
+1. Edit include/board_pins_esp32s3_devkitc1.h with real pin numbers.
+2. Set RAMPART_USE_MOCKS 0 in include/config.h.
+3. Build:
+   pio run
+4. Flash (BOOT + RESET if needed):
+   pio run -t upload
+5. Monitor:
+   pio device monitor
+
+Expected:
+- Init logs OK
+- Feature SUM lines
+- EVT lines when triggering sensors

@@ -1,4 +1,10 @@
 #include "board_pins_esp32s3_devkitc1.h"
+
+// ===== HARDWARE MODE SWITCH =====
+// 1 = mocks only (default, no hardware needed)
+// 0 = real I2S + I2C sensors (ESP32-S3 required)
+
+#include "board_pins_esp32s3_devkitc1.h"
 // Rampart Phase A DSP + Fusion firmware configuration
 //
 // Hard requirement: default to mocks so `pio run` compiles/runs without hardware.
