@@ -1,0 +1,128 @@
+// Rampart Phase A DSP + Fusion firmware configuration
+//
+// Hard requirement: default to mocks so `pio run` compiles/runs without hardware.
+#pragma once
+
+#include <stdint.h>
+
+// 1 = mock audio + mock accel generators.
+// 0 = real I2S + real ADXL345 (skeletons compile; runtime requires hardware).
+#ifndef RAMPART_USE_MOCKS
+#define RAMPART_USE_MOCKS 1
+#endif
+
+// ----------------------------
+// General
+// ----------------------------
+
+// Serial feature summary cadence.
+#ifndef RAMPART_PRINT_INTERVAL_MS
+#define RAMPART_PRINT_INTERVAL_MS 1000u
+#endif
+
+// ----------------------------
+// Audio (I2S + DSP)
+// ----------------------------
+
+#ifndef RAMPART_AUDIO_SAMPLE_RATE_HZ
+#define RAMPART_AUDIO_SAMPLE_RATE_HZ 16000u
+#endif
+
+// Keep this power-of-two-ish for DSP simplicity.
+#ifndef RAMPART_AUDIO_FRAME_SAMPLES
+#define RAMPART_AUDIO_FRAME_SAMPLES 512u
+#endif
+
+// Trigger thresholds (tune later).
+// Units are in raw sample amplitude for peak/RMS and proxy energy for HFE.
+#ifndef RAMPART_AUDIO_RMS_TRIG
+#define RAMPART_AUDIO_RMS_TRIG 1100.0f
+#endif
+
+#ifndef RAMPART_AUDIO_PEAK_TRIG
+#define RAMPART_AUDIO_PEAK_TRIG 6000.0f
+#endif
+
+// High-frequency energy proxy threshold (mean squared first-difference).
+#ifndef RAMPART_AUDIO_HFE_TRIG
+#define RAMPART_AUDIO_HFE_TRIG 3500000.0f
+#endif
+
+// ----------------------------
+// Accelerometer (ADXL345)
+// ----------------------------
+
+#ifndef RAMPART_ACCEL_RATE_HZ
+#define RAMPART_ACCEL_RATE_HZ 80u
+#endif
+
+// Thresholds for impact detection.
+#ifndef RAMPART_ACCEL_DELTA_G_TRIG
+#define RAMPART_ACCEL_DELTA_G_TRIG 0.25f
+#endif
+
+#ifndef RAMPART_ACCEL_IMPULSE_G_TRIG
+#define RAMPART_ACCEL_IMPULSE_G_TRIG 0.18f
+#endif
+
+// ----------------------------
+// Fusion FSM timings
+// ----------------------------
+
+#ifndef RAMPART_FSM_CORRELATION_WINDOW_MS
+#define RAMPART_FSM_CORRELATION_WINDOW_MS 1000u
+#endif
+
+#ifndef RAMPART_FSM_SINGLE_MODALITY_SUSTAIN_MS
+#define RAMPART_FSM_SINGLE_MODALITY_SUSTAIN_MS 400u
+#endif
+
+#ifndef RAMPART_FSM_SUPPRESSION_MS
+#define RAMPART_FSM_SUPPRESSION_MS 10000u
+#endif
+
+// ----------------------------
+// Hardware pins / bus settings (real path)
+// ----------------------------
+
+// ESP32-S3 I2S pins (adjust for your wiring)
+#ifndef RAMPART_I2S_BCLK_PIN
+#define RAMPART_I2S_BCLK_PIN 5
+#endif
+
+#ifndef RAMPART_I2S_WS_PIN
+#define RAMPART_I2S_WS_PIN 6
+#endif
+
+#ifndef RAMPART_I2S_DIN_PIN
+#define RAMPART_I2S_DIN_PIN 4
+#endif
+
+// ADXL345 I2C (adjust for your wiring)
+#ifndef RAMPART_I2C_SDA_PIN
+#define RAMPART_I2C_SDA_PIN 8
+#endif
+
+#ifndef RAMPART_I2C_SCL_PIN
+#define RAMPART_I2C_SCL_PIN 9
+#endif
+
+#ifndef RAMPART_ADXL345_I2C_ADDR
+#define RAMPART_ADXL345_I2C_ADDR 0x53
+#endif
+
+// ----------------------------
+// Mocks: correlated burst scheduler
+// ----------------------------
+
+#if RAMPART_USE_MOCKS
+struct RampartMockCorrelation {
+  uint32_t seed;
+  uint32_t next_burst_ms;
+  uint32_t burst_end_ms;
+  bool correlated;
+};
+
+// Defined in main.cpp when mocks are enabled.
+extern RampartMockCorrelation g_rampart_mock_corr;
+#endif
