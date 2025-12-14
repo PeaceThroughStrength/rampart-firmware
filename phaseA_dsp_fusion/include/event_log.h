@@ -9,6 +9,8 @@
 
 #include <Arduino.h>
 
+#include "event_canonical.h"
+
 enum class EventType : uint8_t {
   BOOT = 0,
   ARMED_CHANGED = 1,
@@ -67,37 +69,38 @@ static inline uint64_t fnv1a64(const void *data, size_t len, uint64_t seed) {
 // MUST include boot_id and prev_hash, MUST NOT include hash.
 static inline uint64_t event_hash(const EventRecord &r) {
   static constexpr uint64_t kFnvOffsetBasis = 14695981039346656037ull;
-  uint64_t h = kFnvOffsetBasis;
 
-  // Chain/identity first.
-  h = fnv1a64(&r.boot_id, sizeof(r.boot_id), h);
-  h = fnv1a64(&r.prev_hash, sizeof(r.prev_hash), h);
+  // Build signing-ready canonical integer record from EventRecord.
+  // Note: EventRecord fields may be a subset; missing canonical fields are
+  // filled deterministically.
+  CanonicalEvent ce{};
+  ce.boot_id = r.boot_id;
+  ce.prev_hash = r.prev_hash;
+  ce.seq = r.seq;
+  ce.monotonic_ms = (uint64_t)r.t_ms;
+  ce.event_type = (uint8_t)r.type;
+  ce.confidence_0_100 = 0;  // EventRecord currently does not carry confidence.
+  ce.src_flags = r.flags;
 
-  // Core metadata.
-  h = fnv1a64(&r.seq, sizeof(r.seq), h);
-  h = fnv1a64(&r.t_ms, sizeof(r.t_ms), h);
-  const uint8_t type_u8 = (uint8_t)r.type;
-  h = fnv1a64(&type_u8, sizeof(type_u8), h);
-  h = fnv1a64(&r.fsm_state, sizeof(r.fsm_state), h);
-  h = fnv1a64(&r.flags, sizeof(r.flags), h);
+  // Audio feature snapshots.
+  ce.audio_rms_q15 = r.audio_rms;
+  ce.audio_hi_q15 = (int16_t)r.audio_hfe;
+  ce.audio_zcr_q15 = (int16_t)r.audio_zcr_q15;
+  ce.audio_peak_q15 = r.audio_peak;
+
+  // Accel feature snapshots.
+  ce.accel_mag_mg = r.accel_mag_mg;
+  ce.accel_peak_mg = r.accel_peak_mg;
+  ce.accel_impulse_q15 = (int16_t)r.accel_impulse_mg;
 
   // Evidence reference.
-  h = fnv1a64(&r.evidence_id, sizeof(r.evidence_id), h);
-  h = fnv1a64(&r.audio_frames, sizeof(r.audio_frames), h);
-  h = fnv1a64(&r.accel_samples, sizeof(r.accel_samples), h);
-  h = fnv1a64(&r.audio_start_idx, sizeof(r.audio_start_idx), h);
-  h = fnv1a64(&r.accel_start_idx, sizeof(r.accel_start_idx), h);
+  ce.evidence_id = r.evidence_id;
+  ce.audio_frames = r.audio_frames;
+  ce.accel_samples = r.accel_samples;
 
-  // Feature snapshots.
-  h = fnv1a64(&r.audio_rms, sizeof(r.audio_rms), h);
-  h = fnv1a64(&r.audio_peak, sizeof(r.audio_peak), h);
-  h = fnv1a64(&r.audio_zcr_q15, sizeof(r.audio_zcr_q15), h);
-  h = fnv1a64(&r.audio_hfe, sizeof(r.audio_hfe), h);
-  h = fnv1a64(&r.accel_mag_mg, sizeof(r.accel_mag_mg), h);
-  h = fnv1a64(&r.accel_peak_mg, sizeof(r.accel_peak_mg), h);
-  h = fnv1a64(&r.accel_impulse_mg, sizeof(r.accel_impulse_mg), h);
-
-  return h;
+  uint8_t buf[kCanonicalEventSerializedLen];
+  const size_t n = serialize_canonical_event(buf, sizeof(buf), ce);
+  return fnv1a64(buf, n, kFnvOffsetBasis);
 }
 
 // Log capacity: tuned for low RAM use.
