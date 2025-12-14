@@ -1,0 +1,12 @@
+# mac
+.DS_Store
+
+# PlatformIO
+.pio/
+.vscode/
+
+# Logs
+*.log
+
+# ESP-IDF build output
+build/
