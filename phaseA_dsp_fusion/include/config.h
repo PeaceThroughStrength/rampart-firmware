@@ -1,3 +1,4 @@
+#include "board_pins_esp32s3_devkitc1.h"
 // Rampart Phase A DSP + Fusion firmware configuration
 //
 // Hard requirement: default to mocks so `pio run` compiles/runs without hardware.
