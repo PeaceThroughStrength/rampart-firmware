@@ -24,6 +24,63 @@ namespace {
 static uint64_t g_boot_id = 0;
 static uint32_t g_next_evidence_id = 1;
 
+// ----------------------------
+// Self-test harness (mock mode)
+// ----------------------------
+
+static uint32_t seen_audio_suspects = 0;
+static uint32_t seen_accel_impacts = 0;
+static uint32_t seen_correlated_alarms = 0;
+static uint32_t fail_missed_expected = 0;
+
+static const char *mock_scenario_str(int scn) {
+  switch ((MockScenario)scn) {
+    case SCN_AUDIO_ONLY:
+      return "SCN_AUDIO_ONLY";
+    case SCN_ACCEL_ONLY:
+      return "SCN_ACCEL_ONLY";
+    case SCN_CORRELATED:
+      return "SCN_CORRELATED";
+    case SCN_UNCORRELATED:
+      return "SCN_UNCORRELATED";
+    default:
+      return "SCN_?";
+  }
+}
+
+static void selftest_on_event(const EventRecord &e) {
+  // Count only meaningful fusion-related events.
+  if (e.type == EventType::AUDIO_SUSPECT) {
+    seen_audio_suspects++;
+  }
+
+  // Treat "accel impacts" as any emitted record that observed an impact at that instant.
+  // This avoids dependency on the FSM choosing an explicit IMPACT_SUSPECT vs ALERT_FIRED.
+  if ((e.flags & 0x04u) != 0u) {
+    seen_accel_impacts++;
+  }
+
+  // "Correlated" alarms = ALERT_FIRED with both audio (loud+HF) and impact flags set.
+  if (e.type == EventType::ALERT_FIRED) {
+    if ((e.flags & 0x07u) == 0x07u) {
+      seen_correlated_alarms++;
+    }
+  }
+}
+
+static bool selftest_pass_now(uint32_t now_ms) {
+  static constexpr uint32_t kSelfTestWindowMs = 30000u;
+  if (now_ms < kSelfTestWindowMs) return false;
+
+  const bool ok_audio = (EXPECT_AUDIO_EVENTS == 0u) ? (seen_audio_suspects == 0u)
+                                                    : (seen_audio_suspects >= EXPECT_AUDIO_EVENTS);
+  const bool ok_accel = (EXPECT_ACCEL_EVENTS == 0u) ? (seen_accel_impacts == 0u)
+                                                    : (seen_accel_impacts >= EXPECT_ACCEL_EVENTS);
+  const bool ok_corr = (EXPECT_CORR_EVENTS == 0u) ? (seen_correlated_alarms == 0u)
+                                                  : (seen_correlated_alarms >= EXPECT_CORR_EVENTS);
+  return ok_audio && ok_accel && ok_corr;
+}
+
 static rampart::AudioEvidenceBuffer g_audio_evid;
 static rampart::AccelEvidenceBuffer g_accel_evid;
 
@@ -52,6 +109,9 @@ static void emit_and_print(EventRecord &e) {
   // Ensure every emitted record carries this boot identity.
   e.boot_id = g_boot_id;
   log_append(e);
+
+  // Update self-test counters from the emitted record.
+  selftest_on_event(e);
 
   // Print the actual stored record (seq/prev_hash/hash are assigned in log_append).
   const uint16_t cap = (uint16_t)RAMPART_EVENT_LOG_CAPACITY;
@@ -82,6 +142,18 @@ void setup() {
   Serial.print("RAMPART_USE_MOCKS=");
   Serial.println((int)RAMPART_USE_MOCKS);
 
+  Serial.print("RAMPART_MOCK_SCENARIO=");
+  Serial.print((int)RAMPART_MOCK_SCENARIO);
+  Serial.print(" (");
+  Serial.print(mock_scenario_str((int)RAMPART_MOCK_SCENARIO));
+  Serial.println(")");
+
+  Serial.print("RAMPART_DETERMINISTIC=");
+  Serial.println((int)RAMPART_DETERMINISTIC);
+
+  Serial.print("RAMPART_MOCK_SEED=0x");
+  Serial.println((unsigned long)RAMPART_MOCK_SEED, HEX);
+
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, LOW);
 
@@ -93,10 +165,12 @@ void setup() {
   log_init();
 
 #if RAMPART_USE_MOCKS
-  g_rampart_mock_corr.seed = 0xC0FFEEu;
-  g_rampart_mock_corr.next_burst_ms = 10000u;
+  // Legacy shared scheduler struct (kept for compatibility, but the deterministic
+  // mocks use fixed formulas rather than shared random schedules).
+  g_rampart_mock_corr.seed = (uint32_t)RAMPART_MOCK_SEED;
+  g_rampart_mock_corr.next_burst_ms = 0u;
   g_rampart_mock_corr.burst_end_ms = 0u;
-  g_rampart_mock_corr.correlated = true;
+  g_rampart_mock_corr.correlated = (RAMPART_MOCK_SCENARIO == SCN_CORRELATED);
 #endif
 
   const bool audio_ok = audio_init();
@@ -233,5 +307,30 @@ void loop() {
     static bool led = false;
     led = !led;
     digitalWrite(LED_BUILTIN, led ? HIGH : LOW);
+  }
+
+  // Periodic self-test status (every 10s).
+  static uint32_t next_selftest_ms = 0;
+  if (now_ms >= next_selftest_ms) {
+    next_selftest_ms = now_ms + 10000u;
+
+    const bool pass_now = selftest_pass_now(now_ms);
+    if (now_ms >= 30000u && !pass_now) {
+      fail_missed_expected++;
+    }
+
+    Serial.print("SELFTEST scenario=");
+    Serial.print(mock_scenario_str((int)RAMPART_MOCK_SCENARIO));
+    Serial.print(" PASS=");
+    Serial.print(pass_now ? 1 : 0);
+    Serial.print(" FAIL=");
+    Serial.print((unsigned long)fail_missed_expected);
+    Serial.print(" counts=aud=");
+    Serial.print((unsigned long)seen_audio_suspects);
+    Serial.print(" acc=");
+    Serial.print((unsigned long)seen_accel_impacts);
+    Serial.print(" corr=");
+    Serial.print((unsigned long)seen_correlated_alarms);
+    Serial.println();
   }
 }

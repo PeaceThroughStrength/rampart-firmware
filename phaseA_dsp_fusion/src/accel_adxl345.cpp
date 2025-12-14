@@ -1,33 +1,54 @@
 #include "accel_adxl345.h"
 
+#include "config.h"
+
 #include <Wire.h>
 
 namespace {
 
 #if RAMPART_USE_MOCKS
 static uint32_t xorshift32(uint32_t &x) {
+  // NOTE: state must never be 0.
   x ^= (x << 13);
   x ^= (x >> 17);
   x ^= (x << 5);
   return x;
 }
 
-static bool in_accel_local_burst(uint32_t now_ms) {
-  static uint32_t seed = 0xACCEBEEFu;
-  static uint32_t next_ms = 9000;
-  static uint32_t end_ms = 0;
-  if (now_ms < end_ms) return true;
-  if (now_ms < next_ms) return false;
-  uint32_t r = xorshift32(seed);
-  uint32_t gap = 10000u + (r % 10001u);
-  uint32_t dur = 80u + ((r >> 16) % 260u);  // 80-340ms
-  next_ms = now_ms + gap;
-  end_ms = now_ms + dur;
-  return true;
+static uint32_t prng_seed_stream(uint32_t stream_id) {
+  uint32_t s = (uint32_t)RAMPART_MOCK_SEED ^ stream_id;
+  if (s == 0u) s = 1u;
+  xorshift32(s);
+  return s;
 }
 
-static bool in_corr_burst(uint32_t now_ms) {
-  return (now_ms < g_rampart_mock_corr.burst_end_ms) && g_rampart_mock_corr.correlated;
+static bool mock_accel_impulse_active(uint32_t now_ms) {
+#if !RAMPART_DETERMINISTIC
+  (void)now_ms;
+  return false;
+#else
+  // Deterministic, fixed schedule.
+  // Keep impulse duration < RAMPART_FSM_SINGLE_MODALITY_SUSTAIN_MS so ACCEL_ONLY
+  // doesn't produce single-modality alerts.
+  static constexpr uint32_t kAudioPhaseMs = 2000u;
+  static constexpr uint32_t kPeriodMs = 12000u;
+  static constexpr uint32_t kImpulseMs = 60u;
+
+  if (RAMPART_MOCK_SCENARIO == SCN_AUDIO_ONLY) return false;
+
+  uint32_t phase_ms = 2500u;  // default for ACCEL_ONLY
+  if (RAMPART_MOCK_SCENARIO == SCN_CORRELATED) {
+    // Aligned within correlation window of the audio burst.
+    phase_ms = kAudioPhaseMs + 500u;
+  } else if (RAMPART_MOCK_SCENARIO == SCN_UNCORRELATED) {
+    // Always outside correlation window.
+    phase_ms = kAudioPhaseMs + RAMPART_FSM_CORRELATION_WINDOW_MS + 500u;
+  }
+
+  if (now_ms < phase_ms) return false;
+  const uint32_t dt = (uint32_t)((now_ms - phase_ms) % kPeriodMs);
+  return (dt < kImpulseMs);
+#endif
 }
 
 #endif
@@ -81,8 +102,10 @@ bool accel_read_sample(AccelSample &out) {
   const uint32_t now_ms = millis();
 
 #if RAMPART_USE_MOCKS
-  static uint32_t seed = 0x2468ACE0u;
-  const bool burst = in_corr_burst(now_ms) || in_accel_local_burst(now_ms);
+  static uint32_t seed = 0;
+  if (seed == 0u) seed = prng_seed_stream(0xACC310u);
+
+  const bool impulse = mock_accel_impulse_active(now_ms);
 
   // Gravity + small noise.
   uint32_t r = xorshift32(seed);
@@ -94,15 +117,16 @@ bool accel_read_sample(AccelSample &out) {
   float y = ny;
   float z = 1.0f + nz;
 
-  if (burst) {
-    // Random-ish impacts: short impulses on x/y/z.
-    const float amp = 0.10f + ((float)((r >> 24) & 0x7F) / 127.0f) * 0.90f;  // 0.1..1.0
-    // Make it spiky: occasionally very sharp.
-    const bool sharp = ((r & 0x7u) == 0);
-    const float spike = sharp ? (amp * 2.0f) : amp;
-    x += (((int)(r & 1u) ? 1.0f : -1.0f) * spike);
-    y += (((int)(r & 2u) ? 1.0f : -1.0f) * (0.6f * spike));
-    z += (((int)(r & 4u) ? 1.0f : -1.0f) * (0.4f * spike));
+  if (impulse) {
+    // Deterministic impact: a short, high-amplitude impulse to reliably exceed
+    // RAMPART_ACCEL_IMPULSE_G_TRIG.
+    // Alternate sign based on the current sample time to increase the impulse score.
+    const uint32_t sample_period_ms = (uint32_t)(1000u / RAMPART_ACCEL_RATE_HZ);
+    const float sgn = (((now_ms / sample_period_ms) & 1u) != 0u) ? 1.0f : -1.0f;
+    const float spike = 2.0f;
+    x += sgn * spike;
+    y += -sgn * (0.7f * spike);
+    z += sgn * (0.3f * spike);
   }
 
   out.x_g = x;

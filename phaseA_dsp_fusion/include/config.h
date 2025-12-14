@@ -5,6 +5,56 @@
 
 #include <stdint.h>
 
+// ----------------------------
+// Deterministic mock harness
+// ----------------------------
+
+// 1 = deterministic mock generators (fixed scheduling + seeded PRNG).
+#ifndef RAMPART_DETERMINISTIC
+#define RAMPART_DETERMINISTIC 1
+#endif
+
+// Base seed for deterministic mock PRNG streams.
+#ifndef RAMPART_MOCK_SEED
+#define RAMPART_MOCK_SEED 0xC0FFEEu
+#endif
+
+enum MockScenario {
+  SCN_AUDIO_ONLY = 1,
+  SCN_ACCEL_ONLY = 2,
+  SCN_CORRELATED = 3,
+  SCN_UNCORRELATED = 4,
+};
+
+// Compile-time default mock scenario.
+#ifndef RAMPART_MOCK_SCENARIO
+#define RAMPART_MOCK_SCENARIO SCN_CORRELATED
+#endif
+
+// Expected outcomes over the self-test window (see main.cpp).
+// Interpreted as minimum required counts unless explicitly checked for == 0.
+#if (RAMPART_MOCK_SCENARIO == SCN_AUDIO_ONLY)
+  #define EXPECT_AUDIO_EVENTS 2u
+  #define EXPECT_ACCEL_EVENTS 0u
+  #define EXPECT_CORR_EVENTS 0u
+#elif (RAMPART_MOCK_SCENARIO == SCN_ACCEL_ONLY)
+  #define EXPECT_AUDIO_EVENTS 0u
+  #define EXPECT_ACCEL_EVENTS 2u
+  #define EXPECT_CORR_EVENTS 0u
+#elif (RAMPART_MOCK_SCENARIO == SCN_CORRELATED)
+  #define EXPECT_AUDIO_EVENTS 2u
+  #define EXPECT_ACCEL_EVENTS 2u
+  #define EXPECT_CORR_EVENTS 2u
+#elif (RAMPART_MOCK_SCENARIO == SCN_UNCORRELATED)
+  #define EXPECT_AUDIO_EVENTS 2u
+  #define EXPECT_ACCEL_EVENTS 2u
+  #define EXPECT_CORR_EVENTS 0u
+#else
+  #define EXPECT_AUDIO_EVENTS 0u
+  #define EXPECT_ACCEL_EVENTS 0u
+  #define EXPECT_CORR_EVENTS 0u
+#endif
+
 // 1 = mock audio + mock accel generators.
 // 0 = real I2S + real ADXL345 (skeletons compile; runtime requires hardware).
 #ifndef RAMPART_USE_MOCKS

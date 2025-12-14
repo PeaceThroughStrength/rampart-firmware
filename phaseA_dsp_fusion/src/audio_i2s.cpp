@@ -14,10 +14,19 @@ static uint32_t s_frame_counter = 0;
 
 static uint32_t xorshift32(uint32_t &x) {
   // xorshift32 PRNG: deterministic, cheap.
+  // NOTE: state must never be 0.
   x ^= (x << 13);
   x ^= (x >> 17);
   x ^= (x << 5);
   return x;
+}
+
+static uint32_t prng_seed_stream(uint32_t stream_id) {
+  uint32_t s = (uint32_t)RAMPART_MOCK_SEED ^ stream_id;
+  if (s == 0u) s = 1u;
+  // One warm-up round to diffuse the seed a bit.
+  xorshift32(s);
+  return s;
 }
 
 static int16_t clamp_i16(int32_t v) {
@@ -26,42 +35,31 @@ static int16_t clamp_i16(int32_t v) {
   return (int16_t)v;
 }
 
-static bool in_corr_burst(uint32_t now_ms) {
-  if (now_ms < g_rampart_mock_corr.burst_end_ms) return true;
-  if (now_ms < g_rampart_mock_corr.next_burst_ms) return false;
+static bool mock_audio_burst_active(uint32_t now_ms) {
+#if !RAMPART_DETERMINISTIC
+  (void)now_ms;
+  return false;
+#else
+  // Deterministic, fixed schedule.
+  // Keep burst duration < RAMPART_FSM_SINGLE_MODALITY_SUSTAIN_MS so single-modality
+  // alerts don't fire in AUDIO_ONLY/UNCORRELATED scenarios.
+  static constexpr uint32_t kAudioPhaseMs = 2000u;
+  static constexpr uint32_t kAudioPeriodMs = 12000u;
+  static constexpr uint32_t kAudioBurstMs = 200u;
 
-  // Schedule next correlated burst.
-  uint32_t r = xorshift32(g_rampart_mock_corr.seed);
-  uint32_t gap = 10000u + (r % 10001u);  // 10-20s
-  uint32_t dur = 250u + ((r >> 16) % 451u);  // 250-700ms
-
-  g_rampart_mock_corr.correlated = ((r & 0x3u) != 0);  // 75%
-  g_rampart_mock_corr.next_burst_ms = now_ms + gap;
-  g_rampart_mock_corr.burst_end_ms = now_ms + dur;
-  return true;
-}
-
-static bool in_audio_local_burst(uint32_t now_ms) {
-  static uint32_t seed = 0xA011234u;
-  static uint32_t next_ms = 7000;
-  static uint32_t end_ms = 0;
-  if (now_ms < end_ms) return true;
-  if (now_ms < next_ms) return false;
-  uint32_t r = xorshift32(seed);
-  uint32_t gap = 10000u + (r % 10001u);
-  uint32_t dur = 120u + ((r >> 16) % 401u);
-  next_ms = now_ms + gap;
-  end_ms = now_ms + dur;
-  return true;
+  if (RAMPART_MOCK_SCENARIO == SCN_ACCEL_ONLY) return false;
+  if (now_ms < kAudioPhaseMs) return false;
+  const uint32_t dt = (uint32_t)((now_ms - kAudioPhaseMs) % kAudioPeriodMs);
+  return (dt < kAudioBurstMs);
+#endif
 }
 
 static void gen_mock_audio(AudioFrame &out) {
   const uint32_t now_ms = millis();
-  const bool corr = in_corr_burst(now_ms) && g_rampart_mock_corr.correlated;
-  const bool local = in_audio_local_burst(now_ms);
-  const bool burst = corr || local;
+  const bool burst = mock_audio_burst_active(now_ms);
 
-  static uint32_t seed = 0x13579BDFu;
+  static uint32_t seed = 0;
+  if (seed == 0u) seed = prng_seed_stream(0xA0D010u);
   const uint32_t frame_start_sample = s_frame_counter * (uint32_t)RAMPART_AUDIO_FRAME_SAMPLES;
   const uint32_t sr = RAMPART_AUDIO_SAMPLE_RATE_HZ;
 
