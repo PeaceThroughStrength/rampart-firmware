@@ -1,0 +1,95 @@
+PROJECT: Rampart Firmware – Phase C (Signed Events)
+
+CONTEXT:
+We are extending an existing, working ESP32 firmware (Phase B).
+Phase B publishes JSON events over MQTT to AWS IoT Core using a DEV_BYPASS crypto block.
+That behavior MUST remain unchanged except where explicitly stated.
+
+DIRECTORY:
+You are ONLY allowed to modify files inside:
+rampart-firmware/phaseC_signed_iot/
+
+DO NOT touch any other folders or repos.
+
+OBJECTIVE:
+Replace the DEV_BYPASS crypto block with a real ECDSA P-256 signature using mbedTLS.
+
+STRICT RULES:
+- DO NOT rearchitect the firmware
+- DO NOT change MQTT topics, WiFi logic, or timing behavior
+- DO NOT remove existing logging
+- DO NOT invent cryptographic primitives
+- Use mbedTLS ONLY (already available on ESP32)
+
+IMPLEMENTATION REQUIREMENTS:
+
+0) NVS Namespacing (MANDATORY)
+- Store keys in an NVS namespace named: rampart_vault
+- Store the private key under key name: ecc_priv
+- Store the public key under key name: ecc_pub
+- Do NOT use any default/other namespace to avoid collisions.
+
+1) Canonical Message
+Create a canonical JSON string identical to backend expectations.
+
+Fields (exact order, exact names):
+- event_id
+- device_id
+- backend_id
+- event_type
+- event_time_iso (ISO-8601 UTC, derived from epoch)
+- fw_version
+- nonce
+
+2) Signing
+- Generate an ECDSA P-256 keypair on first boot
+- Persist keys using ESP32 NVS per requirement (0)
+- Sign the canonical string using SHA-256 + ECDSA
+- Output DER signature, base64 encoded
+
+3) Payload Changes
+Replace this block:
+"crypto": {
+  "alg": "DEV_BYPASS",
+  "sig": "DEV_BYPASS",
+  "pubkey_fingerprint": "DEV_BYPASS",
+  "pubkey": "DEV_BYPASS"
+}
+
+With:
+"crypto": {
+  "alg": "ECDSA_P256_SHA256_DER_B64",
+  "sig": "<base64 DER signature>",
+  "pubkey": "<PEM encoded public key>",
+  "pubkey_fingerprint": "<sha256 hex of PEM>"
+}
+
+4) Logging (MANDATORY)
+Serial output must print:
+- Canonical string
+- Base64 signature
+- Pubkey fingerprint
+- "SIGN_OK" or "SIGN_FAIL"
+
+5) Safety
+- If signing fails, DO NOT publish
+- Flash LED RED on failure
+- LED GREEN on successful publish
+
+6) Resource Discipline (IMPORTANT)
+- Keep crypto work in a single function and avoid large stack allocations.
+- Do not allocate huge buffers on stack; prefer static/global or heap where needed.
+
+DELIVERABLE:
+- Updated src/main.cpp only (preferred)
+- Minimal helper functions if needed
+- No placeholder values
+- Code must compile on ESP32-S3
+
+CONFIRMATION:
+Before generating code, summarize:
+- Files you will modify
+- New functions you will add
+- Where keys are stored (namespace + key names)
+
+Wait for approval before outputting code.
