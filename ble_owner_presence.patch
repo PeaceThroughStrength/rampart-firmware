@@ -1,0 +1,270 @@
+diff --git a/main/rampart_ble.c b/main/rampart_ble.c
+index 6b066fd..7452dfa 100644
+--- a/main/rampart_ble.c
++++ b/main/rampart_ble.c
+@@ -2,6 +2,7 @@
+ 
+ #include "esp_bt.h"
+ #include "esp_bt_main.h"
++#include "esp_timer.h"
+ #include "esp_gap_ble_api.h"
+ #include "esp_gatt_common_api.h"
+ #include "esp_gatts_api.h"
+@@ -22,6 +23,7 @@
+ #define RAMPART_ARM_STATE_UUID    0xA005
+ #define RAMPART_SIREN_UUID        0xA006
+ #define RAMPART_HEARTBEAT_UUID    0xA007
++#define RAMPART_OWNER_PROOF_UUID  0xA008
+ 
+ #define ADV_CONFIG_FLAG    (1 << 0)
+ 
+@@ -39,6 +41,8 @@ enum {
+     IDX_CHAR_VAL_FW,
+     IDX_CHAR_OWNER,
+     IDX_CHAR_VAL_OWNER,
++    IDX_CHAR_PROOF,
++    IDX_CHAR_VAL_PROOF,
+     IDX_CHAR_ARM,
+     IDX_CHAR_VAL_ARM,
+     IDX_CHAR_SIREN,
+@@ -54,11 +58,16 @@ static uint8_t adv_config_done;
+ static uint8_t serial_number_value[] = SERIAL_NUMBER_DEFAULT;
+ static uint8_t firmware_version_value[] = FIRMWARE_VERSION;
+ static char s_owner_key[OWNER_KEY_MAX_LEN + 1];
+-static uint8_t arm_state_value = 0x00;
++static uint8_t owner_proof_value[OWNER_KEY_MAX_LEN] = {0};
++static uint8_t arm_state_value = 0x01; // ARMED by default
+ static uint8_t siren_command_value = 0x00;
+ static uint8_t heartbeat_value[8] = {0};
+ static uint8_t heartbeat_ccc[2] = {0x00, 0x00};
+ 
++static bool g_owner_present = false;
++static bool g_armed = true; // hard requirement: true by default.
++static uint32_t g_auth_deadline_ms = 0; // 0 means “no active window”
++
+ static const uint16_t primary_service_uuid = ESP_GATT_UUID_PRI_SERVICE;
+ static const uint16_t character_decl_uuid = ESP_GATT_UUID_CHAR_DECLARE;
+ static const uint16_t client_char_cfg_uuid = ESP_GATT_UUID_CHAR_CLIENT_CONFIG;
+@@ -72,6 +81,7 @@ static const uint16_t rampart_service_uuid = RAMPART_SERVICE_UUID;
+ static const uint16_t rampart_serial_uuid = RAMPART_SERIAL_UUID;
+ static const uint16_t rampart_firmware_uuid = RAMPART_FIRMWARE_UUID;
+ static const uint16_t rampart_owner_uuid = RAMPART_OWNER_KEY_UUID;
++static const uint16_t rampart_proof_uuid = RAMPART_OWNER_PROOF_UUID;
+ static const uint16_t rampart_arm_uuid = RAMPART_ARM_STATE_UUID;
+ static const uint16_t rampart_siren_uuid = RAMPART_SIREN_UUID;
+ static const uint16_t rampart_heartbeat_uuid = RAMPART_HEARTBEAT_UUID;
+@@ -111,6 +121,8 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
+ static void rampart_owner_key_init_from_nvs(void);
+ static esp_err_t rampart_owner_key_save_to_nvs(const char *owner_key);
+ static void rampart_owner_key_sync_attr_value(void);
++static void rampart_arm_state_sync_attr_value(void);
++static uint32_t rampart_now_ms(void);
+ static esp_err_t rampart_handle_write_event(esp_ble_gatts_cb_param_t *param);
+ 
+ static struct {
+@@ -141,6 +153,11 @@ static const esp_gatts_attr_db_t rampart_gatt_db[IDX_NB] = {
+     [IDX_CHAR_VAL_OWNER] = {{ESP_GATT_RSP_BY_APP}, {ESP_UUID_LEN_16, (uint8_t *)&rampart_owner_uuid, ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE,
+                         OWNER_KEY_MAX_LEN, 0, (uint8_t *)s_owner_key}},
+ 
++    [IDX_CHAR_PROOF] = {{ESP_GATT_AUTO_RSP}, {ESP_UUID_LEN_16, (uint8_t *)&character_decl_uuid, ESP_GATT_PERM_READ,
++                    sizeof(uint8_t), sizeof(uint8_t), (uint8_t *)&char_prop_write}},
++    [IDX_CHAR_VAL_PROOF] = {{ESP_GATT_AUTO_RSP}, {ESP_UUID_LEN_16, (uint8_t *)&rampart_proof_uuid, ESP_GATT_PERM_WRITE,
++                        OWNER_KEY_MAX_LEN, 0, owner_proof_value}},
++
+     [IDX_CHAR_ARM] = {{ESP_GATT_AUTO_RSP}, {ESP_UUID_LEN_16, (uint8_t *)&character_decl_uuid, ESP_GATT_PERM_READ,
+                   sizeof(uint8_t), sizeof(uint8_t), (uint8_t *)&char_prop_read_write}},
+     [IDX_CHAR_VAL_ARM] = {{ESP_GATT_AUTO_RSP}, {ESP_UUID_LEN_16, (uint8_t *)&rampart_arm_uuid, ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE,
+@@ -192,6 +209,11 @@ static void rampart_log_write_payload(const char *label, const uint8_t *data, ui
+     ESP_LOGI(TAG, "%s write (%u bytes): %s", label, len, buffer);
+ }
+ 
++static uint32_t rampart_now_ms(void)
++{
++    return (uint32_t)(esp_timer_get_time() / 1000);
++}
++
+ static void rampart_owner_key_init_from_nvs(void)
+ {
+     s_owner_key[0] = '\0';
+@@ -256,6 +278,21 @@ static void rampart_owner_key_sync_attr_value(void)
+     }
+ }
+ 
++static void rampart_arm_state_sync_attr_value(void)
++{
++    if (s_rampart_profile.handle_table[IDX_CHAR_VAL_ARM] == 0) {
++        return;
++    }
++
++    esp_err_t err = esp_ble_gatts_set_attr_value(
++        s_rampart_profile.handle_table[IDX_CHAR_VAL_ARM],
++        sizeof(arm_state_value),
++        &arm_state_value);
++    if (err != ESP_OK) {
++        ESP_LOGW(TAG, "Failed to sync ARM_STATE attribute value: %s", esp_err_to_name(err));
++    }
++}
++
+ static esp_err_t rampart_handle_write_event(esp_ble_gatts_cb_param_t *param)
+ {
+     const uint16_t handle = param->write.handle;
+@@ -282,13 +319,88 @@ static esp_err_t rampart_handle_write_event(esp_ble_gatts_cb_param_t *param)
+         return save_err;
+     }
+ 
++    if (handle == s_rampart_profile.handle_table[IDX_CHAR_VAL_PROOF]) {
++        if (g_auth_deadline_ms == 0) {
++            ESP_LOGI(TAG, "OWNER_PROOF received but no auth window; ignored");
++            return ESP_OK;
++        }
++
++        const uint32_t now_ms = rampart_now_ms();
++        if (now_ms > g_auth_deadline_ms) {
++            ESP_LOGI(TAG, "OWNER_PROOF late; ignored");
++            return ESP_OK;
++        }
++
++        const size_t stored_len = strnlen(s_owner_key, OWNER_KEY_MAX_LEN);
++        if (stored_len == 0) {
++            ESP_LOGW(TAG, "UNPROVISIONED (empty owner_key); cannot authenticate; remain ARMED");
++            g_owner_present = false;
++            g_armed = true;
++            arm_state_value = 0x01;
++            rampart_arm_state_sync_attr_value();
++            return ESP_OK;
++        }
++
++        if (param->write.len != stored_len) {
++            ESP_LOGW(TAG, "OWNER_PROOF failed (len mismatch); remain ARMED");
++            g_owner_present = false;
++            g_armed = true;
++            arm_state_value = 0x01;
++            rampart_arm_state_sync_attr_value();
++            return ESP_OK;
++        }
++
++        if (memcmp(param->write.value, s_owner_key, stored_len) == 0) {
++            g_owner_present = true;
++            g_armed = false;
++            g_auth_deadline_ms = 0;
++            arm_state_value = 0x00;
++            rampart_arm_state_sync_attr_value();
++            ESP_LOGI(TAG, "OWNER_PRESENT authenticated -> DISARMED");
++            ESP_LOGI(TAG, "EVENT OWNER_PRESENT");
++            ESP_LOGI(TAG, "EVENT STATE_DISARMED");
++        } else {
++            g_owner_present = false;
++            g_armed = true;
++            arm_state_value = 0x01;
++            rampart_arm_state_sync_attr_value();
++            ESP_LOGW(TAG, "OWNER_PROOF failed -> remain ARMED");
++        }
++
++        return ESP_OK;
++    }
++
+     if (handle == s_rampart_profile.handle_table[IDX_CHAR_VAL_ARM]) {
+-        if (param->write.len > 0) {
+-            arm_state_value = param->write.value[0];
+-            esp_ble_gatts_set_attr_value(handle, sizeof(arm_state_value), &arm_state_value);
+-            ESP_LOGI(TAG, "ARM_STATE set to 0x%02X", arm_state_value);
+-            // TODO: Apply arm/disarm state machine transitions here.
++        if (param->write.len == 0) {
++            return ESP_OK;
+         }
++
++        const uint8_t requested = param->write.value[0];
++        if (requested == 0x00) {
++            if (!g_owner_present) {
++                ESP_LOGW(TAG, "Reject DISARM while owner absent");
++                g_armed = true;
++                arm_state_value = 0x01;
++                rampart_arm_state_sync_attr_value();
++                return ESP_OK;
++            }
++
++            g_armed = false;
++            arm_state_value = 0x00;
++            rampart_arm_state_sync_attr_value();
++            ESP_LOGI(TAG, "ARM_STATE forced DISARMED (owner present)");
++            return ESP_OK;
++        }
++
++        if (requested == 0x01) {
++            g_armed = true;
++            arm_state_value = 0x01;
++            rampart_arm_state_sync_attr_value();
++            ESP_LOGI(TAG, "ARM_STATE forced ARMED");
++            return ESP_OK;
++        }
++
++        ESP_LOGW(TAG, "ARM_STATE write ignored (invalid value 0x%02X)", requested);
+         return ESP_OK;
+     }
+ 
+@@ -328,6 +440,10 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
+             }
+             memcpy(s_rampart_profile.handle_table, param->add_attr_tab.handles, sizeof(uint16_t) * IDX_NB);
+             rampart_owner_key_sync_attr_value();
++            g_owner_present = false;
++            g_armed = true;
++            arm_state_value = 0x01;
++            rampart_arm_state_sync_attr_value();
+             esp_ble_gatts_start_service(s_rampart_profile.handle_table[IDX_SVC]);
+             ESP_LOGI(TAG, "Rampart service started");
+             break;
+@@ -353,9 +469,22 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
+             break;
+         case ESP_GATTS_CONNECT_EVT:
+             s_rampart_profile.conn_id = param->connect.conn_id;
++            g_owner_present = false;
++            g_armed = true;
++            arm_state_value = 0x01;
++            rampart_arm_state_sync_attr_value();
++            g_auth_deadline_ms = rampart_now_ms() + 5000;
++            ESP_LOGI(TAG, "OWNER_ABSENT (connect) -> ARMED (awaiting proof)");
++            ESP_LOGI(TAG, "BLE connected; awaiting owner proof (5s)");
+             ESP_LOGI(TAG, "Device connected, conn_id=%u", s_rampart_profile.conn_id);
+             break;
+         case ESP_GATTS_DISCONNECT_EVT:
++            g_auth_deadline_ms = 0;
++            g_owner_present = false;
++            g_armed = true;
++            arm_state_value = 0x01;
++            rampart_arm_state_sync_attr_value();
++            ESP_LOGI(TAG, "OWNER_ABSENT (disconnect) -> ARMED");
+             ESP_LOGI(TAG, "Device disconnected, restarting advertising");
+             s_rampart_profile.conn_id = 0xFFFF;
+             esp_ble_gap_start_advertising((esp_ble_adv_params_t *)&rampart_adv_params);
+@@ -382,6 +511,16 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
+     }
+ }
+ 
++bool rampart_ble_is_armed(void)
++{
++    return g_armed;
++}
++
++bool rampart_ble_owner_present(void)
++{
++    return g_owner_present;
++}
++
+ esp_err_t rampart_ble_init(void)
+ {
+     esp_err_t ret = esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT);
+diff --git a/main/rampart_ble.h b/main/rampart_ble.h
+index ff05554..f2f508a 100644
+--- a/main/rampart_ble.h
++++ b/main/rampart_ble.h
+@@ -1,5 +1,10 @@
+ #pragma once
+ 
++#include <stdbool.h>
++
+ #include "esp_err.h"
+ 
+ esp_err_t rampart_ble_init(void);
++
++bool rampart_ble_is_armed(void);
++bool rampart_ble_owner_present(void);
