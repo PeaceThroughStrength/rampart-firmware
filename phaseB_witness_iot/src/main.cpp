@@ -142,7 +142,7 @@ void loop() {
     payload += "\"pubkey_fingerprint\":\"DEV_BYPASS\",";
     payload += "\"pubkey\":\"DEV_BYPASS\"},";
     payload += "\"event_id\":\"" + event_id + "\",";
-    payload += "\"evidence\":{\"status\":\"BREACH_DETECTED\",\"raw_hash\":\"abababababababababababababababababababababababababababababababab\"}";
+    payload += "\"evidence\":{\"kind\":\"MOTION\",\"sensor\":\"PIR\",\"raw_hash\":\"abababababababababababababababababababababababababababababababab\"}";
     payload += "}";
 Serial0.println("Publishing Event...");
 if (mqtt.publish(MQTT_TOPIC, payload.c_str())) {
@@ -158,4 +158,3 @@ if (mqtt.publish(MQTT_TOPIC, payload.c_str())) {
     }
   }
 }
-

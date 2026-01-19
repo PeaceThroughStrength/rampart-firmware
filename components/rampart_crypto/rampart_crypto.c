@@ -359,7 +359,7 @@ esp_err_t rampart_crypto_run_self_test(void)
         .event_id = "00000000-0000-0000-0000-000000000000",
         .device_serial = "RAMPART-SERIAL-0001",
         .backend_id = "dev_dummy",
-        .event_type = "INTRUSION_TEST",
+        .event_type = "CRYPTO_SELF_TEST",
         .occurred_at = "2025-01-01T00:00:00.000Z",
         .firmware_version = "0.0.1",
         .nonce = "0123456789abcdef0123456789abcdef"

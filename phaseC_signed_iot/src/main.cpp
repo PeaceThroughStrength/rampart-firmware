@@ -47,6 +47,33 @@ static String g_config_version;
 static BlePresence g_blePresence;
 static StateMachine g_stateMachine;
 
+static bool g_mqtt_connected = false;
+static bool g_time_synced = false;
+static unsigned long g_time_sync_start_ms = 0;
+
+static unsigned long g_last_status_sent_ms = 0;
+static uint32_t g_last_status_device_seq = 0;
+static unsigned long g_last_status_unix = 0;
+
+static unsigned long g_last_owner_present_change_ms = 0;
+static bool g_pending_owner_present_emit = false;
+static bool g_last_owner_present = false;
+
+static bool g_last_siren_on = false;
+static bool g_last_time_synced = false;
+static StateMachine::State g_last_state = StateMachine::State::ARMED;
+
+static unsigned long g_next_status_heartbeat_ms = 0;
+
+static const unsigned long STATUS_BOOT_TIMEOUT_MS = 45 * 1000UL;
+static const unsigned long STATUS_HEARTBEAT_NORMAL_MS = 60000UL;
+static const unsigned long STATUS_HEARTBEAT_ALERT_MS = 10000UL;
+static const unsigned long STATUS_HEARTBEAT_JITTER_MS = 500UL;
+static const unsigned long STATUS_COALESCE_MS = 750UL;
+static const unsigned long OWNER_PRESENT_DEBOUNCE_MS = 350UL;
+static const unsigned long STATUS_UNSYNCED_COOLDOWN_MS = 5000UL;
+static unsigned long g_last_unsynced_status_ms = 0;
+
 // Forward declarations (helpers defined before their implementations)
 static String uuidV4();
 static bool rampart_sign_canonical_and_get_crypto_block(
@@ -76,6 +103,9 @@ static void onOwnerPresenceChanged(bool present, void* ctx) {
   StateMachine* sm = (StateMachine*)ctx;
   if (!sm) return;
   sm->setOwnerPresent(present);
+
+  g_last_owner_present_change_ms = millis();
+  g_pending_owner_present_emit = true;
 }
 
 
@@ -100,10 +130,12 @@ static void rampart_iso8601_utc_from_epoch(unsigned long epoch_s, char* out, siz
 
 // Publish a signed event to MQTT_TOPIC with a variable event_type.
 // Keeps canonical signing rules identical to the existing MOTION_DETECTED implementation.
+// evidence_kind and evidence_sensor must remain factual only (no conclusions).
 // extra_fields_json must be either empty or a string starting with ',' containing valid JSON fields.
 static bool rampart_publish_signed_event(
   const char* event_type,
-  const char* evidence_status,
+  const char* evidence_kind,
+  const char* evidence_sensor,
   const String& extra_fields_json,
   String* out_event_id
 ) {
@@ -162,12 +194,13 @@ static bool rampart_publish_signed_event(
   payload += "\"pubkey\":\"" + pubkey_json + "\",";
   payload += "\"pubkey_fingerprint\":\"" + pubkey_fp + "\"},";
   payload += "\"event_id\":\"" + event_id + "\",";
-  payload += "\"evidence\":{\"status\":\"" + String(evidence_status ? evidence_status : "") + "\",\"raw_hash\":\"abababababababababababababababababababababababababababababababab\"}";
+  payload += "\"evidence\":{\"kind\":\"" + String(evidence_kind ? evidence_kind : "") + "\",\"sensor\":\"" + String(evidence_sensor ? evidence_sensor : "") + "\",\"raw_hash\":\"abababababababababababababababababababababababababababababababab\"}";
   if (extra_fields_json.length() > 0) {
     payload += extra_fields_json;
   }
   payload += "}";
 
+  Serial0.printf("MQTT_PUB topic=%s bytes=%u\n", MQTT_TOPIC, (unsigned)payload.length());
   Serial0.println("Publishing Event...");
   if (mqtt.publish(MQTT_TOPIC, payload.c_str())) {
     Serial0.println("SENT: " + payload);
@@ -177,10 +210,85 @@ static bool rampart_publish_signed_event(
     return true;
   }
 
-  Serial0.println("PUBLISH_FAIL");
+  Serial0.printf("PUBLISH_FAIL mqtt_state=%d bytes=%u\n", mqtt.state(), (unsigned)payload.length());
   neopixelWrite(RGB_BUILTIN, 255, 0, 0);
   // NOTE: do not flash GREEN after a failed publish
   return false;
+}
+
+static bool rampart_can_emit_status(bool allow_unsynced) {
+  if (!g_mqtt_connected) return false;
+  if (g_time_synced) return true;
+  if (!allow_unsynced) return false;
+
+  const unsigned long now_ms = millis();
+  if (g_time_sync_start_ms == 0) return false;
+  if ((now_ms - g_time_sync_start_ms) < STATUS_BOOT_TIMEOUT_MS) return false;
+  if (g_last_unsynced_status_ms > 0 && (now_ms - g_last_unsynced_status_ms) < STATUS_UNSYNCED_COOLDOWN_MS) {
+    return false;
+  }
+  return true;
+}
+
+static unsigned long rampart_jitter_ms(unsigned long base, unsigned long jitter) {
+  if (jitter == 0) return base;
+  const long delta = (long)random(0, (long)jitter * 2) - (long)jitter;
+  const long out = (long)base + delta;
+  return out > 0 ? (unsigned long)out : base;
+}
+
+static bool rampart_publish_status(bool allow_unsynced, const char* reason) {
+  if (!rampart_can_emit_status(allow_unsynced)) return false;
+
+  const unsigned long now_ms = millis();
+  if (g_last_status_sent_ms > 0 && (now_ms - g_last_status_sent_ms) < STATUS_COALESCE_MS) {
+    return false;
+  }
+
+  const bool time_synced = RampartLog::wallClockIsSynced();
+  const unsigned long now_s = (unsigned long)time(nullptr);
+  char occurredAtIso[32];
+  rampart_iso8601_utc_from_epoch(now_s, occurredAtIso, sizeof(occurredAtIso));
+
+  // Evidence pipeline placeholders (to be wired to real evidence logic in Phase C)
+  const float evidence_score = 0.0f;
+  const bool intrusion_confirmed = g_stateMachine.intrusionConfirmed();
+
+  String extra = ",\"payload\":{";
+  extra += "\"owner_present\":" + String(g_stateMachine.isOwnerPresent() ? "true" : "false");
+  extra += ",\"state\":\"" + String(StateMachine::stateName(g_stateMachine.state())) + "\"";
+  extra += ",\"siren\":\"" + String(g_last_siren_on ? "ON" : "OFF") + "\"";
+  extra += ",\"evidence_score\":" + String(evidence_score, 2);
+  extra += ",\"contributing_kinds\":[]";
+  extra += ",\"intrusion_confirmed\":" + String(intrusion_confirmed ? "true" : "false");
+  extra += ",\"time_synced\":" + String(time_synced ? "true" : "false");
+  extra += ",\"firmware_version\":\"" RAMPART_FIRMWARE_VERSION "\"";
+  extra += ",\"device_seq\":" + String(g_device_seq + 1);
+  extra += ",\"occurredAt\":\"" + String(occurredAtIso) + "\"";
+  if (time_synced) {
+    extra += ",\"unix_seconds\":" + String(now_s);
+  } else {
+    extra += ",\"unix_seconds\":0";
+  }
+  extra += "}";
+
+  String event_id;
+  const bool ok = rampart_publish_signed_event("STATUS", "STATUS", "STATUS", extra, &event_id);
+  if (ok) {
+    g_last_status_sent_ms = now_ms;
+    g_last_status_device_seq = g_device_seq;
+    g_last_status_unix = time_synced ? now_s : 0;
+    g_last_time_synced = time_synced;
+    if (!time_synced) {
+      g_last_unsynced_status_ms = now_ms;
+    }
+    Serial0.printf("STATUS_EMIT_OK event_id=%s reason=%s time_synced=%d\n",
+                   event_id.c_str(), reason ? reason : "", time_synced ? 1 : 0);
+  } else {
+    Serial0.printf("STATUS_EMIT_FAIL reason=%s\n", reason ? reason : "");
+  }
+
+  return ok;
 }
 
 static void rampart_publish_config_ack(const char* event_type, const String& cfg_version, const String& reason_opt) {
@@ -193,7 +301,7 @@ static void rampart_publish_config_ack(const char* event_type, const String& cfg
   }
 
   String event_id;
-  const bool ok = rampart_publish_signed_event(event_type, event_type, extra, &event_id);
+  const bool ok = rampart_publish_signed_event(event_type, event_type, event_type, extra, &event_id);
   if (ok) {
     Serial0.printf("ACK_PUB_OK event_id=%s event_type=%s\n", event_id.c_str(), event_type);
   } else {
@@ -307,11 +415,11 @@ static void onMqttMessage(char* topic, byte* payload, unsigned int length) {
 
     // Demo-safe behavior: simulate only explicit, deterministic signals.
     if (strcmp(signal, "MOTION") == 0) {
-      (void)rampart_publish_signed_event("MOTION_DETECTED", "SIMULATED", "", nullptr);
+      (void)rampart_publish_signed_event("MOTION_DETECTED", "MOTION", "SIMULATED", "", nullptr);
     } else if (strcmp(signal, "GLASS_BREAK") == 0) {
-      (void)rampart_publish_signed_event("GLASS_BREAK_DETECTED", "SIMULATED", "", nullptr);
+      (void)rampart_publish_signed_event("GLASS_BREAK_DETECTED", "GLASS_BREAK", "SIMULATED", "", nullptr);
     } else if (strcmp(signal, "PRESSURE") == 0) {
-      (void)rampart_publish_signed_event("PRESSURE_DETECTED", "SIMULATED", "", nullptr);
+      (void)rampart_publish_signed_event("PRESSURE_DETECTED", "PRESSURE", "SIMULATED", "", nullptr);
     } else {
       Serial0.printf("SIMULATE_SIGNAL unknown_signal=%s\n", signal);
     }
@@ -322,13 +430,17 @@ static void onMqttMessage(char* topic, byte* payload, unsigned int length) {
   // Emits signed events so backend ingest + push allowlist can be exercised end-to-end.
   if (cmd == "SIREN_ON") {
     Serial0.println("SIREN_ON: publish event");
-    (void)rampart_publish_signed_event("SIREN_ON", "SIREN_ON", "", nullptr);
+    g_last_siren_on = true;
+    (void)rampart_publish_status(true, "siren_on");
+    (void)rampart_publish_signed_event("SIREN_ON", "SIREN", "SIREN", "", nullptr);
     return;
   }
 
   if (cmd == "SIREN_OFF") {
     Serial0.println("SIREN_OFF: publish event");
-    (void)rampart_publish_signed_event("SIREN_OFF", "SIREN_OFF", "", nullptr);
+    g_last_siren_on = false;
+    (void)rampart_publish_status(true, "siren_off");
+    (void)rampart_publish_signed_event("SIREN_OFF", "SIREN", "SIREN", "", nullptr);
     return;
   }
 
@@ -657,9 +769,10 @@ static void connectMqtt() {
 
   mqtt.setCallback(onMqttMessage);
 
-  mqtt.setBufferSize(1024);
+  mqtt.setBufferSize(4096);
   Serial0.println("Connecting to AWS IoT...");
   if (mqtt.connect(CLIENT_ID)) {
+    g_mqtt_connected = true;
     Serial0.println("CONNECTED (GREEN)");
     neopixelWrite(RGB_BUILTIN, 0, 255, 0);
 
@@ -670,6 +783,7 @@ static void connectMqtt() {
       Serial0.printf("SUB_FAIL topic=%s\n", g_cmd_topic.c_str());
     }
   } else {
+    g_mqtt_connected = false;
     Serial0.printf("FAILED, state=%d", mqtt.state());
     neopixelWrite(RGB_BUILTIN, 255, 0, 0);
   }
@@ -695,6 +809,7 @@ void setup() {
   g_device_seq = prefs.getUInt("device_seq", 0);
   g_config_version = prefs.getString("config_version", "");
   Serial0.printf("SEQ_LOADED=%lu\n", (unsigned long)g_device_seq);
+  g_time_sync_start_ms = millis();
 
   pinMode(TRIGGER_PIN, INPUT);
   neopixelWrite(RGB_BUILTIN, 255, 0, 255); // Boot = Purple
@@ -702,6 +817,7 @@ void setup() {
   // BLE presence-driven arming state.
   // Boot default is ARMED until a phone connects.
   g_stateMachine.begin(false);
+  g_last_state = g_stateMachine.state();
   g_blePresence.setOwnerPresenceChangedCallback(onOwnerPresenceChanged, &g_stateMachine);
   (void)g_blePresence.begin(DEVICE_ID);
 
@@ -711,12 +827,51 @@ void setup() {
   Serial0.println("WiFi OK");
 
   syncTime();
+  g_time_synced = RampartLog::wallClockIsSynced();
   connectMqtt();
+
+  if (g_time_synced && g_mqtt_connected) {
+    (void)rampart_publish_status(false, "boot");
+  }
 }
 
 void loop() {
-  if (!mqtt.connected()) connectMqtt();
+  if (!mqtt.connected()) {
+    g_mqtt_connected = false;
+    connectMqtt();
+  }
   mqtt.loop();
+
+  const unsigned long now_ms = millis();
+  const bool time_synced = RampartLog::wallClockIsSynced();
+  if (time_synced != g_time_synced) {
+    g_time_synced = time_synced;
+    if (g_time_synced && g_mqtt_connected) {
+      g_last_status_sent_ms = 0;
+      (void)rampart_publish_status(false, "time_sync");
+    }
+  }
+
+  if (g_pending_owner_present_emit) {
+    if ((now_ms - g_last_owner_present_change_ms) >= OWNER_PRESENT_DEBOUNCE_MS) {
+      g_pending_owner_present_emit = false;
+      (void)rampart_publish_status(true, "owner_present");
+    }
+  }
+
+  if (g_stateMachine.state() != g_last_state) {
+    g_last_state = g_stateMachine.state();
+    (void)rampart_publish_status(true, "state_change");
+  }
+
+  if (g_next_status_heartbeat_ms == 0 || now_ms >= g_next_status_heartbeat_ms) {
+    if (rampart_publish_status(true, "heartbeat")) {
+      const bool alertHeartbeat = g_last_siren_on;
+      const unsigned long baseInterval = alertHeartbeat ? STATUS_HEARTBEAT_ALERT_MS : STATUS_HEARTBEAT_NORMAL_MS;
+      const unsigned long interval = rampart_jitter_ms(baseInterval, STATUS_HEARTBEAT_JITTER_MS);
+      g_next_status_heartbeat_ms = now_ms + interval;
+    }
+  }
 
   // Pin Status Debugger (2 Hz)
   static uint32_t lastLog = 0;
@@ -752,6 +907,6 @@ void loop() {
       return;
     }
 
-    (void)rampart_publish_signed_event("MOTION_DETECTED", "BREACH_DETECTED", "", nullptr);
+    (void)rampart_publish_signed_event("MOTION_DETECTED", "MOTION", "PIR", "", nullptr);
   }
 }
